@@ -1,12 +1,80 @@
 import type { Request, Response, NextFunction } from 'express';
-import { cacheHitCount, cacheMissCount } from '../metrics';
+import { cacheHitCount, cacheMissCount, cacheEvictionCount } from '../metrics';
+
+const MAX_ENTRIES = parseInt(process.env.CACHE_MAX_ENTRIES || '1000', 10);
 
 interface CacheEntry {
   data: unknown;
   expiresAt: number;
+  /** Timestamp of last access for LRU eviction */
+  lastAccessed: number;
 }
 
-const responseCache = new Map<string, CacheEntry>();
+/**
+ * LRU cache implementation with TTL support.
+ * Uses Map for O(1) operations and maintains insertion/access order.
+ */
+class LRUCache<K, V> {
+  private cache: Map<K, V>;
+  private maxEntries: number;
+
+  constructor(maxEntries: number) {
+    this.cache = new Map<K, V>();
+    this.maxEntries = maxEntries;
+  }
+
+  get(key: K): V | undefined {
+    const value = this.cache.get(key);
+    if (value !== undefined) {
+      // Move to end (most recently used)
+      this.cache.delete(key);
+      this.cache.set(key, value);
+    }
+    return value;
+  }
+
+  set(key: K, value: V): void {
+    // If key exists, update it
+    if (this.cache.has(key)) {
+      this.cache.delete(key);
+    }
+
+    // Add new entry
+    this.cache.set(key, value);
+
+    // Evict if over capacity
+    if (this.cache.size > this.maxEntries) {
+      // Remove first entry (least recently used)
+      const firstKey = this.cache.keys().next().value;
+      if (firstKey !== undefined) {
+        this.cache.delete(firstKey);
+        cacheEvictionCount.inc();
+      }
+    }
+  }
+
+  delete(key: K): boolean {
+    return this.cache.delete(key);
+  }
+
+  clear(): void {
+    this.cache.clear();
+  }
+
+  size(): number {
+    return this.cache.size;
+  }
+
+  keys(): IterableIterator<K> {
+    return this.cache.keys();
+  }
+
+  values(): IterableIterator<V> {
+    return this.cache.values();
+  }
+}
+
+const responseCache = new LRUCache<string, CacheEntry>(MAX_ENTRIES);
 
 export interface CacheOptions {
   ttl: number; // milliseconds
@@ -37,6 +105,8 @@ export function cacheMiddleware(options: CacheOptions) {
     const cached = responseCache.get(cacheKey);
 
     if (cached && cached.expiresAt > Date.now()) {
+      // Update last accessed timestamp for LRU ordering
+      cached.lastAccessed = Date.now();
       res.setHeader('X-Cache-Hit', 'true');
       cacheHitCount.inc({ method: req.method, route: req.path });
       res.json(cached.data);
@@ -52,6 +122,7 @@ export function cacheMiddleware(options: CacheOptions) {
         responseCache.set(cacheKey, {
           data,
           expiresAt: Date.now() + options.ttl,
+          lastAccessed: Date.now(),
         });
         cacheMissCount.inc({ method: req.method, route: req.path });
         res.setHeader(
@@ -81,9 +152,10 @@ export function invalidateCache(pattern?: string): void {
   }
 }
 
-export function getCacheStats(): { size: number; entries: string[] } {
+export function getCacheStats(): { size: number; entries: string[]; maxEntries: number } {
   return {
-    size: responseCache.size,
+    size: responseCache.size(),
+    maxEntries: MAX_ENTRIES,
     entries: Array.from(responseCache.keys()),
   };
 }

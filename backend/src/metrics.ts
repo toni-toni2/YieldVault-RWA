@@ -48,6 +48,12 @@ export const cacheMissCount = new Counter({
   registers: [register],
 });
 
+export const cacheEvictionCount = new Counter({
+  name: 'cache_eviction_count',
+  help: 'Number of cache evictions due to size limit',
+  registers: [register],
+});
+
 // --- Vault Specific Metrics ---
 
 export const vaultTvl = new Gauge({
