@@ -9,9 +9,14 @@ import { initTracing, shutdownTracing, getCurrentTraceId } from './tracing';
 initTracing();
 
 import express, { Express, Request, Response, NextFunction, ErrorRequestHandler } from 'express';
-import rateLimit from 'express-rate-limit';
 import NodeCache from 'node-cache';
+import {
+  depositsLimiter,
+  summaryLimiter,
+  defaultLimiter,
+} from './rateLimiter';
 import { loginHandler, refreshHandler } from './auth';
+import { idempotencyStore } from './idempotency';
 import { createAdminAuditMiddleware, getAuditLogs, getAuditLogMetrics } from './auditLog';
 import { recordAdminAuditLog } from './adminAudit';
 import { startApySnapshotScheduler } from './apySnapshot';
@@ -141,54 +146,19 @@ async function buildImpersonatedVaultState(wallet: string) {
 }
 
 // ─── Rate Limiting Middleware ────────────────────────────────────────────────
-// Issue #145: Rate limiting per IP/user key
-
-/**
- * Global rate limiter
- * Default: 100 requests per 15 minutes per IP
- */
-const globalLimiter = rateLimit({
-  windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS || '900000', 10), // 15 minutes
-  max: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS || '100', 10),
-  message: 'Too many requests from this IP, please try again later.',
-  standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
-  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
-  skip: (req: Request) => {
-    // Skip rate limiting for health and ready checks
-    return req.path === '/health' || req.path === '/ready';
-  },
-  handler: (req: Request, res: Response) => {
-    const retryAfter = req.rateLimit?.resetTime ? Number(req.rateLimit.resetTime) : undefined;
-    res.status(429).json({
-      error: 'Too many requests',
-      status: 429,
-      message: 'Rate limit exceeded. Please try again later.',
-      retryAfter,
-    });
-  },
-});
-
-/**
- * API endpoint rate limiter (stricter)
- * Per-user or per-API-key rate limiting
- */
-const apiLimiter = rateLimit({
-  windowMs: parseInt(process.env.API_RATE_LIMIT_WINDOW_MS || '60000', 10), // 1 minute
-  max: parseInt(process.env.API_RATE_LIMIT_MAX_REQUESTS || '30', 10),
-  keyGenerator: (req: Request) => {
-    // Use API key if provided, otherwise use IP
-    return req.headers['x-api-key'] as string || req.ip || 'unknown';
-  },
-  handler: (req: Request, res: Response) => {
-    const retryAfter = req.rateLimit?.resetTime ? Number(req.rateLimit.resetTime) : undefined;
-    res.status(429).json({
-      error: 'API rate limit exceeded',
-      status: 429,
-      message: 'Too many API requests. Please try again later.',
-      retryAfter,
-    });
-  },
-});
+// Issue #455: Use the Redis-backed limiter factory from rateLimiter.ts.
+//
+// Three pre-built instances are imported from rateLimiter.ts:
+//   depositsLimiter – stricter limits for write-heavy deposit/withdrawal routes
+//   summaryLimiter  – relaxed limits for read-only summary/metrics routes
+//   defaultLimiter  – fallback for all other API routes
+//
+// All instances use fail-open behaviour: when Redis is configured but
+// unreachable the `skip` function returns true so requests are processed
+// normally. When Redis is not configured an in-memory store is used.
+//
+// Rate-limit policy information (RateLimit-* headers) and Retry-After are
+// included in all 429 responses by the handlers in rateLimiter.ts.
 
 // ─── Middleware ──────────────────────────────────────────────────────────────
 
@@ -234,7 +204,11 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   next();
 });
 
-app.use(globalLimiter);
+// Apply the Redis-backed default limiter globally (skip health/ready probes).
+app.use((req: Request, res: Response, next: NextFunction) => {
+  if (req.path === '/health' || req.path === '/ready') return next();
+  return defaultLimiter(req, res, next);
+});
 
 // Capture immutable admin audit records for every /admin request.
 app.use('/admin', createAdminAuditMiddleware());
@@ -355,15 +329,17 @@ app.get('/api/vault/summary', (req: Request, res: Response) => {
 /**
  * POST /auth/login
  * Issue 15-min access JWT + 7-day refresh token on wallet authentication.
+ * Uses depositsLimiter (stricter) as auth is a write-heavy, security-sensitive operation.
  */
-app.post('/auth/login', apiLimiter, loginHandler);
+app.post('/auth/login', depositsLimiter, loginHandler);
 
 /**
  * POST /auth/refresh
  * Rotate the refresh token and issue a new access JWT.
  * Reuse of a revoked refresh token invalidates the entire session (401).
+ * Uses depositsLimiter (stricter) as token refresh is write-heavy.
  */
-app.post('/auth/refresh', apiLimiter, refreshHandler);
+app.post('/auth/refresh', depositsLimiter, refreshHandler);
 
 // Versioned API v1
 const apiV1 = express.Router();
@@ -378,21 +354,23 @@ apiV1.use('/', listRouter);
 apiV1.use('/referrals', referralRouter);
 
 /**
- * Example protected API endpoint with caching
- * Demonstrates rate limiting per API key and response caching
+ * GET /api/v1/vault/summary – read-only summary; relaxed rate limit.
  */
 app.get(
   '/api/v1/vault/summary',
-  apiLimiter,
+  summaryLimiter,
   cacheMiddleware({ ttl: cacheVaultMetricsTtl }),
   (_req: Request, res: Response) => {
     res.json(buildVaultSummaryResponse());
   },
 );
 
+/**
+ * GET /api/vault/summary – deprecated unversioned alias; relaxed rate limit.
+ */
 app.get(
   '/api/vault/summary',
-  apiLimiter,
+  summaryLimiter,
   cacheMiddleware({ ttl: cacheVaultMetricsTtl }),
   (_req: Request, res: Response) => {
     res.setHeader('deprecation', 'true');
@@ -826,6 +804,82 @@ app.get('/admin/jobs/dashboard', validateApiKey, (_req: Request, res: Response) 
       </body>
     </html>
   `);
+});
+
+// ─── Idempotency Admin Endpoints (Issues #457 & #466) ────────────────────────
+
+/**
+ * GET /admin/idempotency/keys
+ * Lists idempotency keys with metadata.
+ * Optional query param: ?prefix=<string> to filter keys by prefix.
+ * Requires API key authentication.
+ */
+app.get('/admin/idempotency/keys', validateApiKey, (req: Request, res: Response) => {
+  const prefix = typeof req.query.prefix === 'string' ? req.query.prefix : undefined;
+  const keys = idempotencyStore.inspectKeys(prefix);
+  res.status(200).json({
+    keys,
+    count: keys.length,
+    metrics: idempotencyStore.getMetrics(),
+    timestamp: new Date().toISOString(),
+  });
+});
+
+/**
+ * DELETE /admin/idempotency/keys/:key
+ * Removes a single idempotency key from the store.
+ * Requires API key authentication.
+ */
+app.delete('/admin/idempotency/keys/:key', validateApiKey, (req: Request, res: Response) => {
+  const key = decodeURIComponent(req.params.key);
+  const deleted = idempotencyStore.deleteKey(key);
+  if (!deleted) {
+    res.status(404).json({
+      error: 'Not Found',
+      status: 404,
+      message: `Idempotency key '${key}' not found`,
+    });
+    return;
+  }
+  res.status(200).json({
+    message: `Idempotency key '${key}' deleted`,
+    metrics: idempotencyStore.getMetrics(),
+    timestamp: new Date().toISOString(),
+  });
+});
+
+/**
+ * DELETE /admin/idempotency/keys
+ * Flushes the entire idempotency store.
+ * Requires super-admin API key.
+ */
+app.delete('/admin/idempotency/keys', validateApiKey, (req: Request, res: Response) => {
+  if (!hasRequiredApiKeyRole(req, 'super-admin')) {
+    res.status(403).json({
+      error: 'Forbidden',
+      status: 403,
+      message: 'Super-admin role is required to flush the idempotency store',
+    });
+    return;
+  }
+  idempotencyStore.clear();
+  res.status(200).json({
+    message: 'Idempotency store flushed',
+    metrics: idempotencyStore.getMetrics(),
+    timestamp: new Date().toISOString(),
+  });
+});
+
+/**
+ * GET /admin/idempotency/metrics
+ * Returns hit/conflict/eviction counters for the idempotency store.
+ * Requires API key authentication.
+ */
+app.get('/admin/idempotency/metrics', validateApiKey, (_req: Request, res: Response) => {
+  res.status(200).json({
+    metrics: idempotencyStore.getMetrics(),
+    timestamp: new Date().toISOString(),
+  });
 });
 
 // ─── Vault Metrics Poll Cycle ────────────────────────────────────────────────

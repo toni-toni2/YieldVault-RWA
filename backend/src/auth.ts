@@ -23,9 +23,16 @@
  *   Swap for Redis in production multi-instance deployments.
  *
  * Environment variables:
- *   JWT_SECRET               – HMAC-SHA256 signing secret (min 32 chars recommended)
+ *   JWT_SECRET               – HMAC-SHA256 signing secret (required in production,
+ *                              min 32 chars with sufficient entropy)
  *   JWT_ACCESS_TTL_SECONDS   – access token TTL (default: 900 = 15 minutes)
  *   JWT_REFRESH_TTL_SECONDS  – refresh token TTL (default: 604800 = 7 days)
+ *
+ * Startup validation (Issue #454):
+ *   In production (NODE_ENV=production) the server will refuse to start if
+ *   JWT_SECRET is absent, shorter than 32 characters, or has insufficient
+ *   entropy (less than 3 distinct character classes). Development and test
+ *   environments fall back to the built-in default secret.
  */
 
 import crypto from 'crypto';
@@ -35,6 +42,89 @@ import { logger } from './middleware/structuredLogging';
 // ─── Config ───────────────────────────────────────────────────────────────────
 
 const DEFAULT_JWT_SECRET = 'change-me-in-production-must-be-at-least-32-characters';
+
+/** Minimum byte length required for the JWT secret in production. */
+const MIN_SECRET_LENGTH = 32;
+
+/**
+ * Counts the number of distinct character classes present in `s`.
+ * Classes: lowercase letters, uppercase letters, digits, symbols/other.
+ */
+function countCharacterClasses(s: string): number {
+  let classes = 0;
+  if (/[a-z]/.test(s)) classes++;
+  if (/[A-Z]/.test(s)) classes++;
+  if (/[0-9]/.test(s)) classes++;
+  if (/[^a-zA-Z0-9]/.test(s)) classes++;
+  return classes;
+}
+
+/**
+ * Validates the JWT secret for production use.
+ *
+ * Rules:
+ *  1. Must be present (non-empty).
+ *  2. Must be at least MIN_SECRET_LENGTH characters.
+ *  3. Must contain at least 3 distinct character classes (length + entropy check).
+ *
+ * Returns `null` when the secret passes validation, or a human-readable error
+ * string describing the first failing rule.
+ */
+export function validateJwtSecret(secret: string): string | null {
+  if (!secret || secret.trim() === '') {
+    return 'JWT_SECRET is not set. Set a strong secret before starting in production.';
+  }
+  if (secret.length < MIN_SECRET_LENGTH) {
+    return (
+      `JWT_SECRET is too short (${secret.length} chars). ` +
+      `Production requires at least ${MIN_SECRET_LENGTH} characters.`
+    );
+  }
+  if (countCharacterClasses(secret) < 3) {
+    return (
+      'JWT_SECRET has insufficient entropy. ' +
+      'Use a mix of uppercase, lowercase, digits, and symbols ' +
+      '(at least 3 of the 4 character classes).'
+    );
+  }
+  return null;
+}
+
+/**
+ * Performs startup validation of the JWT secret.
+ *
+ * - In production  : calls `process.exit(1)` with a clear error if validation fails.
+ * - In development / test : emits a warning but continues with the default secret.
+ */
+export function assertJwtSecretValid(): void {
+  const isProduction = process.env.NODE_ENV === 'production';
+  const secret = process.env.JWT_SECRET || '';
+
+  if (isProduction) {
+    const error = validateJwtSecret(secret);
+    if (error) {
+      // Use console.error directly so the message is always visible even if
+      // the structured logger has not yet been fully initialised.
+      console.error(
+        `[auth] FATAL – JWT secret validation failed: ${error}\n` +
+        'Set a strong JWT_SECRET environment variable and restart the server.'
+      );
+      process.exit(1);
+    }
+  } else {
+    // Non-production: warn when falling back to the default secret.
+    if (!process.env.JWT_SECRET) {
+      console.warn(
+        '[auth] WARNING – JWT_SECRET is not set. ' +
+        'Using insecure default secret for development/test. ' +
+        'This MUST be changed before deploying to production.'
+      );
+    }
+  }
+}
+
+// Run validation at module load time so the server fails fast.
+assertJwtSecretValid();
 
 function getSecret(): string {
   return process.env.JWT_SECRET || DEFAULT_JWT_SECRET;
